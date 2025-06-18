@@ -1,62 +1,66 @@
-import os
-import sqlite3
-from fastapi import FastAPI
+# api/main.py
+
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
-from typing import Optional
+import sqlite3
+import numpy as np
+import json
+import os
 import requests
-from dotenv import load_dotenv
-
-load_dotenv()
-
-DB_PATH = "data/embeddings.db"
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 app = FastAPI()
 
-class Query(BaseModel):
+# Load all embeddings from the precomputed SQLite DB
+conn = sqlite3.connect("data/embeddings.db", check_same_thread=False)
+cursor = conn.cursor()
+cursor.execute("SELECT id, content, source, embedding FROM embeddings")
+rows = cursor.fetchall()
+
+# Cache embeddings in memory
+EMBEDDINGS = []
+for id_, content, source, emb_blob in rows:
+    emb = np.frombuffer(emb_blob, dtype=np.float32)
+    EMBEDDINGS.append((id_, content, source, emb))
+
+class QueryRequest(BaseModel):
     question: str
-    image: Optional[str] = None
 
-def search_chunks(query, k=5):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, content, source FROM embeddings")
-    rows = cursor.fetchall()
-    conn.close()
+# Use OpenRouter for generation (or replace with any other lightweight API)
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+HEADERS = {
+    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+    "HTTP-Referer": "https://your-app-name.onrender.com",
+    "X-Title": "TDS Virtual TA"
+}
 
-    # Use naive keyword ranking instead of model-based similarity
-    ranked = sorted(rows, key=lambda row: query.lower() in row[1].lower(), reverse=True)
-    top_chunks = [{"id": r[0], "content": r[1], "source": r[2]} for r in ranked[:k]]
-    return top_chunks
-
-def generate_answer_openrouter(query, context_chunks):
-    context_text = "\n\n".join([chunk['content'] for chunk in context_chunks])
-    prompt = f"""Answer the question based on the following context:\n\n{context_text}\n\nQuestion: {query}"""
-
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    data = {
-        "model": "openai/gpt-3.5-turbo",
-        "messages": [
-            {"role": "system", "content": "You're a helpful TA for IIT Madras Data Science."},
-            {"role": "user", "content": prompt}
-        ]
-    }
-
-    try:
-        response = requests.post(OPENROUTER_URL, headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        return f"❌ Failed to get response from GPT: {str(e)}"
+def cosine_similarity(vec1, vec2):
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
 @app.post("/query")
-def query_route(query: Query):
-    top_chunks = search_chunks(query.question, k=5)
-    answer = generate_answer_openrouter(query.question, top_chunks)
-    links = list(set(chunk["source"] for chunk in top_chunks))
+def query(request: QueryRequest):
+    # Load embedding model only for single text
+    from sentence_transformers import SentenceTransformer
+    model = SentenceTransformer("all-MiniLM-L6-v2")  # Lightweight
+
+    question_emb = model.encode(request.question)
+
+    # Find top 3 most similar chunks
+    similarities = [(id_, content, source, cosine_similarity(question_emb, emb)) for id_, content, source, emb in EMBEDDINGS]
+    top_chunks = sorted(similarities, key=lambda x: x[3], reverse=True)[:3]
+    context = "\n\n".join([chunk[1] for chunk in top_chunks])
+
+    # Generate answer using OpenRouter
+    payload = {
+        "model": "openai/gpt-3.5-turbo",
+        "messages": [
+            {"role": "system", "content": "You are a helpful teaching assistant."},
+            {"role": "user", "content": f"Answer this based on context:\n\n{context}\n\nQuestion: {request.question}"}
+        ]
+    }
+    res = requests.post("https://openrouter.ai/api/v1/chat/completions", headers=HEADERS, json=payload)
+    answer = res.json()["choices"][0]["message"]["content"]
+
+    # Include links
+    links = list(set(chunk[2] for chunk in top_chunks))
+
     return {"answer": answer, "links": links}
