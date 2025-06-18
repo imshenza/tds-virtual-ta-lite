@@ -1,51 +1,38 @@
 import os
 import sqlite3
-import base64
 from fastapi import FastAPI
 from pydantic import BaseModel
-from sentence_transformers import SentenceTransformer, util
+from typing import Optional
 import requests
 from dotenv import load_dotenv
-from typing import Optional
 
 load_dotenv()
 
 DB_PATH = "data/embeddings.db"
-MODEL = SentenceTransformer("all-MiniLM-L6-v2")
-
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+app = FastAPI()
 
 class Query(BaseModel):
     question: str
     image: Optional[str] = None
 
-app = FastAPI()
-
-def get_top_chunks(query, k=5):
+def search_chunks(query, k=5):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, content, source, embedding FROM embeddings")
+    cursor.execute("SELECT id, content, source FROM embeddings")
     rows = cursor.fetchall()
     conn.close()
 
-    contents = [row[1] for row in rows]
-    sources = [row[2] for row in rows]
-    embeddings = [row[3] for row in rows]
+    # Use naive keyword ranking instead of model-based similarity
+    ranked = sorted(rows, key=lambda row: query.lower() in row[1].lower(), reverse=True)
+    top_chunks = [{"id": r[0], "content": r[1], "source": r[2]} for r in ranked[:k]]
+    return top_chunks
 
-    import numpy as np
-    import torch
-
-    query_emb = MODEL.encode(query, convert_to_numpy=True)
-    doc_embs = np.array([np.frombuffer(e, dtype=np.float32) for e in embeddings])
-    scores = util.cos_sim(torch.tensor(query_emb), torch.tensor(doc_embs))[0]
-
-    top_k_idx = torch.topk(scores, k).indices.tolist()
-    return [{"content": contents[i], "source": sources[i]} for i in top_k_idx]
-
-def generate_answer(query, chunks):
-    context = "\n\n".join([chunk["content"] for chunk in chunks])
-    prompt = f"Answer the question based on the following context:\n\n{context}\n\nQuestion: {query}"
+def generate_answer_openrouter(query, context_chunks):
+    context_text = "\n\n".join([chunk['content'] for chunk in context_chunks])
+    prompt = f"""Answer the question based on the following context:\n\n{context_text}\n\nQuestion: {query}"""
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -55,7 +42,7 @@ def generate_answer(query, chunks):
     data = {
         "model": "openai/gpt-3.5-turbo",
         "messages": [
-            {"role": "system", "content": "You're a helpful teaching assistant for the IIT Madras Data Science program."},
+            {"role": "system", "content": "You're a helpful TA for IIT Madras Data Science."},
             {"role": "user", "content": prompt}
         ]
     }
@@ -65,11 +52,11 @@ def generate_answer(query, chunks):
         response.raise_for_status()
         return response.json()["choices"][0]["message"]["content"]
     except Exception as e:
-        return f"❌ Error generating answer: {e}"
+        return f"❌ Failed to get response from GPT: {str(e)}"
 
 @app.post("/query")
-def handle_query(q: Query):
-    chunks = get_top_chunks(q.question)
-    answer = generate_answer(q.question, chunks)
-    links = list(set(chunk["source"] for chunk in chunks))
+def query_route(query: Query):
+    top_chunks = search_chunks(query.question, k=5)
+    answer = generate_answer_openrouter(query.question, top_chunks)
+    links = list(set(chunk["source"] for chunk in top_chunks))
     return {"answer": answer, "links": links}
